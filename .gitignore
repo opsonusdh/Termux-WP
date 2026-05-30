@@ -1,0 +1,6 @@
+bot_output.log
+node_modules
+package-lock.json
+package.json
+.wwebjs_cache
+.wwebjs_auth
