@@ -63,16 +63,19 @@ app.get('/api/status', (req, res) => {
 
 // API Endpoint 1: Send Outbound Message (POST)
 app.post('/api/send', async (req, res) => {
-    const { to, message } = req.body;
+    const { to, message, quotedMessageId } = req.body;
     if (!to || !message) {
         return res.status(400).json({ error: "Parameters missing: 'to' and 'message' are required." });
     }
-
     const targetId = to.includes('@') ? to : `${to.replace(/[+\s]/g, '')}@c.us`;
-
     try {
-        const response = await whatsappClient.sendMessage(targetId, message);
-        return res.status(200).json({ success: true, messageId: response.id.id, status: "sent" });
+        const msgOptions = {};
+        if (quotedMessageId) {
+            // Pass the serialized ID directly — whatsapp-web.js resolves it internally
+            msgOptions.quotedMessageId = quotedMessageId;
+        }
+        const response = await whatsappClient.sendMessage(targetId, message, msgOptions);
+        return res.status(200).json({ success: true, messageId: response.id._serialized, status: "sent" });
     } catch (error) {
         return res.status(500).json({ success: false, error: error.message });
     }
@@ -128,6 +131,145 @@ app.get('/api/chats', async (req, res) => {
             return 0;
         });
         return res.status(200).json({ success: true, count: chats.length, chats });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// API Endpoint 4: Show typing indicator
+app.post('/api/typing', async (req, res) => {
+    const { to, duration } = req.body;
+    if (!to) return res.status(400).json({ error: "'to' is required." });
+    const targetId = to.includes('@') ? to : `${to.replace(/[+\s]/g, '')}@c.us`;
+    try {
+        const chat = await whatsappClient.getChatById(targetId);
+        await chat.sendStateTyping();
+        // Auto-clear as a safety net — the actual message send clears it too
+        setTimeout(() => chat.clearState().catch(() => {}), duration || 15000);
+        return res.status(200).json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// API Endpoint 5: Mark chat as read (clears unread badge)
+app.post('/api/seen', async (req, res) => {
+    const { to } = req.body;
+    if (!to) return res.status(400).json({ error: "'to' is required." });
+    const targetId = to.includes('@') ? to : `${to.replace(/[+\s]/g, '')}@c.us`;
+    try {
+        const chat = await whatsappClient.getChatById(targetId);
+        await chat.sendSeen();
+        return res.status(200).json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// API Endpoint 6: React to a message with an emoji
+app.post('/api/react', async (req, res) => {
+    const { messageId, emoji } = req.body;
+    if (!messageId || !emoji) return res.status(400).json({ error: "'messageId' and 'emoji' are required." });
+    try {
+        const msg = await whatsappClient.getMessageById(messageId);
+        await msg.react(emoji);
+        return res.status(200).json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// API Endpoint 7: Get contact info (name, number, about, profile pic)
+app.get('/api/contact/:jid', async (req, res) => {
+    const jid = req.params.jid;
+    try {
+        const contact = await whatsappClient.getContactById(jid);
+        const info = {
+            jid:         contact.id._serialized,
+            name:        contact.name || contact.pushname || null,
+            number:      contact.number,
+            isMyContact: contact.isMyContact,
+            isBlocked:   contact.isBlocked,
+            isBusiness:  contact.isBusiness,
+            about:       null,
+            profilePicUrl: null,
+        };
+        try { info.about         = await contact.getAbout(); }         catch (_) {}
+        try { info.profilePicUrl = await contact.getProfilePicUrl(); } catch (_) {}
+        return res.status(200).json({ success: true, contact: info });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// API Endpoint 8: Get group participant list
+app.get('/api/group/:jid/participants', async (req, res) => {
+    const jid = req.params.jid;
+    try {
+        const chat = await whatsappClient.getChatById(jid);
+        if (!chat.isGroup) return res.status(400).json({ success: false, error: "Not a group chat." });
+        const participants = chat.participants.map(p => ({
+            jid:         p.id._serialized,
+            number:      p.id.user,
+            isAdmin:     p.isAdmin,
+            isSuperAdmin: p.isSuperAdmin,
+        }));
+        return res.status(200).json({ success: true, groupName: chat.name, count: participants.length, participants });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// API Endpoint 9: Download media from a specific message (on-demand, not automatic)
+app.post('/api/media', async (req, res) => {
+    const { messageId } = req.body;
+    if (!messageId) return res.status(400).json({ error: "'messageId' is required." });
+    try {
+        const msg = await whatsappClient.getMessageById(messageId);
+        if (!msg.hasMedia) return res.status(400).json({ success: false, error: "Message has no media." });
+        const media = await msg.downloadMedia();
+        if (!media) return res.status(500).json({ success: false, error: "Media download returned null." });
+        return res.status(200).json({
+            success:  true,
+            mimetype: media.mimetype,
+            filename: media.filename || null,
+            data:     media.data,   // base64-encoded binary
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// API Endpoint 10: Search messages in a chat
+app.post('/api/search', async (req, res) => {
+    const { to, query, limit } = req.body;
+    if (!to || !query) return res.status(400).json({ error: "'to' and 'query' are required." });
+    const targetId = to.includes('@') ? to : `${to.replace(/[+\s]/g, '')}@c.us`;
+    try {
+        const results = await whatsappClient.searchMessages(query, { chatId: targetId, limit: limit || 20 });
+        const hits = results.map(m => ({
+            messageId:  m.id._serialized,
+            timestamp:  new Date(m.timestamp * 1000).toISOString(),
+            direction:  m.fromMe ? 'OUTBOUND' : 'INBOUND',
+            body:       m.body,
+            type:       m.type,
+        }));
+        return res.status(200).json({ success: true, count: hits.length, results: hits });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// API Endpoint 11: Archive or unarchive a chat
+app.post('/api/archive', async (req, res) => {
+    const { to, archive } = req.body;
+    if (!to) return res.status(400).json({ error: "'to' is required." });
+    const targetId = to.includes('@') ? to : `${to.replace(/[+\s]/g, '')}@c.us`;
+    try {
+        const chat = await whatsappClient.getChatById(targetId);
+        const shouldArchive = archive !== false;
+        await chat.archive(shouldArchive);
+        return res.status(200).json({ success: true, archived: shouldArchive });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
     }
@@ -207,23 +349,40 @@ let resolvedMyNumber = null;
 
 // --- Helper: did this message @mention the session owner? ---
 // Reads identity directly from the live WhatsApp session — no config, no hardcoding.
-// WhatsApp populates msg.mentionedIds with JIDs (e.g. "919876543210@c.us") for every
-// @mention made via the autocomplete picker. We compare against the session owner's WID.
+//
+// IMPORTANT: msg.mentionedIds is an array of ContactId OBJECTS {server, user, _serialized},
+// NOT plain strings — even though the docs show it as strings. We handle both defensively.
+// getMentions() is used as an authoritative async fallback in case the format is unexpected.
 async function didMentionMe(msg) {
-    if (!msg.mentionedIds || msg.mentionedIds.length === 0) return false;
     try {
-        // Live session identity — available once 'ready' fires
         const myWid  = whatsappClient.info?.wid;
-        const myJid  = myWid?._serialized;          // full JID: "919876543210@c.us"
-        const myUser = myWid?.user || resolvedMyNumber; // number only: "919876543210"
+        const myJid  = myWid?._serialized;              // e.g. "919876543210@c.us"
+        const myUser = myWid?.user || resolvedMyNumber; // e.g. "919876543210"
+        if (!myJid && !myUser) return false;
 
-        for (const jid of msg.mentionedIds) {
-            // Exact JID match (fastest, most reliable)
-            if (myJid && jid === myJid) return true;
-            // Strip domain suffix and compare number — handles @c.us vs @s.whatsapp.net
-            if (myUser && jid.replace(/@.*/, '') === myUser) return true;
+        // Fast path: check mentionedIds — handles both string and ContactId object formats
+        for (const entry of (msg.mentionedIds ?? [])) {
+            const jidStr = (typeof entry === 'string') ? entry : (entry?._serialized ?? '');
+            if (!jidStr) continue;
+            const numStr = jidStr.split('@')[0];
+            if (myJid && jidStr === myJid)   return true;
+            if (myUser && numStr === myUser) return true;
         }
-    } catch (_) {}
+
+        // Authoritative fallback: getMentions() always resolves full Contact objects.
+        // Catches edge cases where mentionedIds had an unexpected format or was empty
+        // despite a real @mention occurring (e.g. some WA versions omit mentionedIds).
+        const mentions = await msg.getMentions();
+        for (const contact of (mentions ?? [])) {
+            const cJid = contact.id?._serialized ?? '';
+            const cNum = contact.id?.user         ?? '';
+            if (myJid && cJid === myJid)   return true;
+            if (myUser && cNum === myUser) return true;
+        }
+
+    } catch (err) {
+        console.error('[didMentionMe] Error:', err.message);
+    }
     return false;
 }
 
@@ -347,6 +506,14 @@ whatsappClient.on('message_create', async (msg) => {
         // Detect @mention in groups — Python side uses this to gate auto-replies
         const mentionedMe = isGroup ? await didMentionMe(msg) : false;
 
+        // Debug: log raw mentionedIds so you can verify the format in your terminal
+        if (isGroup) {
+            const rawIds = (msg.mentionedIds ?? []).map(e =>
+                typeof e === 'string' ? e : JSON.stringify(e)
+            ).join(', ') || '(none)';
+            console.log(`[Mention] group="${chat.name}" | mentionedIds=[${rawIds}] | result=${mentionedMe}`);
+        }
+
         // For group messages, capture the actual sender's number (author field)
         // msg.from is the group JID; msg.author is the sender's number JID
         const groupSender = isGroup ? (msg.author || null) : null;
@@ -355,7 +522,7 @@ whatsappClient.on('message_create', async (msg) => {
         const mediaInfo = extractMediaInfo(msg);
 
         const eventPayload = {
-            messageId:   msg.id.id,
+            messageId:   msg.id._serialized,  // full serialized ID — needed for quoted replies
             sender:      msg.from,           // group JID for groups, number@c.us for DMs
             groupSender: groupSender,         // actual sender JID inside group (null for DMs)
             profileName: msg._data?.notifyName || "Anonymous",
