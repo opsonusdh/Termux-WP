@@ -104,6 +104,35 @@ app.post('/api/context', async (req, res) => {
     }
 });
 
+// API Endpoint 3: List All Chats and Groups
+app.get('/api/chats', async (req, res) => {
+    if (clientState !== "READY") {
+        return res.status(503).json({ success: false, error: "WhatsApp client not ready.", state: clientState });
+    }
+    try {
+        const raw = await whatsappClient.getChats();
+        const chats = raw.map(chat => ({
+            jid:           chat.id._serialized,
+            name:          chat.name || chat.id.user || "Unknown",
+            type:          chat.isGroup ? "group" : "dm",
+            unread:        chat.unreadCount || 0,
+            lastMessageAt: chat.timestamp ? new Date(chat.timestamp * 1000).toISOString() : null,
+            isArchived:    chat.archived  || false,
+            isMuted:       chat.isMuted   || false,
+            isPinned:      chat.pinned    || false,
+        }));
+        // Pinned first, then sorted by most recent message
+        chats.sort((a, b) => {
+            if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+            if (a.lastMessageAt && b.lastMessageAt) return b.lastMessageAt.localeCompare(a.lastMessageAt);
+            return 0;
+        });
+        return res.status(200).json({ success: true, count: chats.length, chats });
+    } catch (err) {
+        return res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // --- 3. WHATSAPP BROWSER ENGINE ARCHITECTURE ---
 const whatsappClient = new Client({
     authStrategy: new LocalAuth(),
@@ -129,11 +158,24 @@ whatsappClient.on('qr', (qr) => {
     broadcast('SYSTEM_QR_REQUIRED', { qr, info: "Scan authorization required." });
 });
 
-whatsappClient.on('ready', () => {
+whatsappClient.on('ready', async () => {
     clientState = "READY";
     lastQR = null;
     console.log('\nSystem Connected! Your phone is now sending and receiving.');
-    broadcast('SYSTEM_READY', { status: "online", source: "Termux Android Core" });
+    // Resolve the session owner's number from the live WhatsApp session.
+    // This is the only place identity is derived — no config file, no hardcoding.
+    try {
+        const me = whatsappClient.info;
+        if (me?.wid?.user) {
+            resolvedMyNumber = me.wid.user;
+            console.log(`[Session] Owner number resolved: ${resolvedMyNumber}`);
+        }
+    } catch (_) {}
+    broadcast('SYSTEM_READY', {
+        status: "online",
+        source: "Termux Android Core",
+        myNumber: resolvedMyNumber,   // Python side stores this for its own mention fallback
+    });
 });
 
 whatsappClient.on('authenticated', () => {
@@ -152,12 +194,132 @@ whatsappClient.on('auth_failure', (msg) => {
 whatsappClient.on('disconnected', (reason) => {
     clientState = "DISCONNECTED";
     lastQR = null;
-    console.log('🔌 WhatsApp client disconnected:', reason);
+    console.log('WhatsApp client disconnected:', reason);
     broadcast('SYSTEM_DISCONNECTED', { reason });
 });
 
 // Deduplicate message IDs — fetchMessages can re-fire message_create on first chat load
 const _processedMsgIds = new Set();
+
+// The logged-in user's phone number — resolved from the WhatsApp session on 'ready'.
+// Never hardcoded; safe to publish on GitHub.
+let resolvedMyNumber = null;
+
+// --- Helper: did this message @mention the session owner? ---
+// Reads identity directly from the live WhatsApp session — no config, no hardcoding.
+// WhatsApp populates msg.mentionedIds with JIDs (e.g. "919876543210@c.us") for every
+// @mention made via the autocomplete picker. We compare against the session owner's WID.
+async function didMentionMe(msg) {
+    if (!msg.mentionedIds || msg.mentionedIds.length === 0) return false;
+    try {
+        // Live session identity — available once 'ready' fires
+        const myWid  = whatsappClient.info?.wid;
+        const myJid  = myWid?._serialized;          // full JID: "919876543210@c.us"
+        const myUser = myWid?.user || resolvedMyNumber; // number only: "919876543210"
+
+        for (const jid of msg.mentionedIds) {
+            // Exact JID match (fastest, most reliable)
+            if (myJid && jid === myJid) return true;
+            // Strip domain suffix and compare number — handles @c.us vs @s.whatsapp.net
+            if (myUser && jid.replace(/@.*/, '') === myUser) return true;
+        }
+    } catch (_) {}
+    return false;
+}
+
+// --- Helper: extract media metadata without downloading the binary ---
+// Returns an object describing type, caption, mimetype, filename, etc.
+// Never triggers a media download — only reads fields already on the msg object.
+function extractMediaInfo(msg) {
+    const msgType = (msg.type || 'chat').toLowerCase();
+
+    // Plain text — no media
+    if (msgType === 'chat' || msgType === 'text') {
+        return { type: 'text', hasMedia: false };
+    }
+
+    const info = {
+        type:    msgType,          // 'image'|'video'|'audio'|'ptt'|'sticker'|
+                                   // 'document'|'location'|'vcard'|'revoked'|…
+        hasMedia: msg.hasMedia || false,
+        caption:  msg.body || null, // WhatsApp puts caption in body for image/video
+    };
+
+    // Fields on _data that are available without a download
+    const d = msg._data || {};
+    if (d.mimetype)   info.mimetype   = d.mimetype;
+    if (d.filename)   info.filename   = d.filename;
+    if (d.size)       info.size       = d.size;       // bytes
+    if (d.duration)   info.duration   = d.duration;   // seconds (audio/video/ptt)
+    if (d.width)      info.width      = d.width;
+    if (d.height)     info.height     = d.height;
+    if (d.isGif)      info.isGif      = d.isGif;
+    if (d.isViewOnce) info.isViewOnce = d.isViewOnce;
+
+    // Sticker-specific
+    if (msgType === 'sticker') {
+        if (d.isAnimated    !== undefined) info.isAnimated   = d.isAnimated;
+        if (d.stickerPackId)               info.stickerPackId = d.stickerPackId;
+    }
+
+    // Location carries lat/lng directly on msg.location
+    if (msgType === 'location') {
+        info.hasMedia = false;
+        if (msg.location) {
+            info.latitude    = msg.location.latitude;
+            info.longitude   = msg.location.longitude;
+            info.description = msg.location.description || null;
+        }
+    }
+
+    // vCard: raw vcard text is already in body
+    if (msgType === 'vcard' || msgType === 'multi_vcard') {
+        info.hasMedia = false;
+        info.vcard = msg.body || null;
+    }
+
+    if (msgType === 'revoked') {
+        info.hasMedia = false;
+    }
+
+    return info;
+}
+
+// --- Helper: short label for console log ---
+function mediaLabel(mediaInfo) {
+    switch (mediaInfo.type) {
+        case 'text':        return `"${mediaInfo.caption}"`;
+        case 'image':       return mediaInfo.caption ? `[Image] "${mediaInfo.caption}"` : '[Image]';
+        case 'video':       return mediaInfo.isGif   ? '[GIF]'   : (mediaInfo.caption ? `[Video] "${mediaInfo.caption}"` : '[Video]');
+        case 'audio':       return '[Audio]';
+        case 'ptt':         return '[Voice note]';
+        case 'sticker':     return mediaInfo.isAnimated ? '[Animated sticker]' : '[Sticker]';
+        case 'document':    return `[Document${mediaInfo.filename ? ': ' + mediaInfo.filename : ''}]`;
+        case 'location':    return `[Location: ${mediaInfo.latitude}, ${mediaInfo.longitude}]`;
+        case 'vcard':       return '[Contact card]';
+        case 'multi_vcard': return '[Contact cards]';
+        case 'revoked':     return '[Deleted message]';
+        default:            return `[${mediaInfo.type}]`;
+    }
+}
+
+// --- Helper: context history entries — media-aware ---
+function buildContextHistory(rawHistory) {
+    return rawHistory.map(m => {
+        const mType = (m.type || 'chat').toLowerCase();
+        const entry = {
+            timestamp: new Date(m.timestamp * 1000).toISOString(),
+            direction: m.fromMe ? 'OUTBOUND' : 'INBOUND',
+            type:      mType,
+            body:      m.body || null,
+        };
+        if (mType !== 'chat' && mType !== 'text') {
+            entry.mediaType = mType;
+            if (m._data?.mimetype) entry.mimetype = m._data.mimetype;
+        }
+        return entry;
+    });
+}
 
 // Capture Incoming Traffic Streams
 whatsappClient.on('message_create', async (msg) => {
@@ -175,27 +337,39 @@ whatsappClient.on('message_create', async (msg) => {
 
     try {
         const chat = await msg.getChat();
-        const CONTEXT_LOOKUP_LIMIT = 3; // Loads the last 3 messages automatically on new incoming texts per user request
+        const isGroup = msg.from.endsWith('@g.us');
+
+        const CONTEXT_LOOKUP_LIMIT = 3;
         const rawHistory = await chat.fetchMessages({ limit: CONTEXT_LOOKUP_LIMIT });
 
-        const contextHistory = rawHistory.map(m => ({
-            timestamp: new Date(m.timestamp * 1000).toISOString(),
-            direction: m.fromMe ? 'OUTBOUND' : 'INBOUND',
-            body: m.body
-        }));
+        const contextHistory = buildContextHistory(rawHistory);
+
+        // Detect @mention in groups — Python side uses this to gate auto-replies
+        const mentionedMe = isGroup ? await didMentionMe(msg) : false;
+
+        // For group messages, capture the actual sender's number (author field)
+        // msg.from is the group JID; msg.author is the sender's number JID
+        const groupSender = isGroup ? (msg.author || null) : null;
+
+        // Extract media metadata (never downloads the binary)
+        const mediaInfo = extractMediaInfo(msg);
 
         const eventPayload = {
-            messageId: msg.id.id,
-            sender: msg.from,
+            messageId:   msg.id.id,
+            sender:      msg.from,           // group JID for groups, number@c.us for DMs
+            groupSender: groupSender,         // actual sender JID inside group (null for DMs)
             profileName: msg._data?.notifyName || "Anonymous",
-            text: msg.body,
-            isGroup: msg.from.endsWith('@g.us'),
-            context_history: contextHistory
+            text:        msg.body || null,    // text body / caption (null for pure media)
+            isGroup:     isGroup,
+            chatName:    chat.name || null,   // group/contact display name
+            mentionedMe: mentionedMe,         // true only if owner was @mentioned in group
+            media:       mediaInfo,           // type, hasMedia, caption, mimetype, etc.
+            context_history: contextHistory,
         };
 
         // Stream event over your WebSocket cluster instantly
         broadcast('MESSAGE_RECEIVED', eventPayload);
-        console.log(`[WS Broadcast] New Message from ${eventPayload.profileName}: "${msg.body}"`);
+        console.log(`[WS Broadcast] ${eventPayload.profileName} (group=${isGroup}, mention=${mentionedMe}): ${mediaLabel(mediaInfo)}`);
 
     } catch (err) {
         console.error("Error generating tracking event payload:", err.message);
