@@ -13,6 +13,27 @@ const server = http.createServer(app);
 let clientState = "INITIALIZING";
 let lastQR = null;
 
+// The logged-in user's phone number — resolved from the WhatsApp session on 'ready'.
+// Never hardcoded; safe to publish on GitHub.
+let resolvedMyNumber = null;
+
+// Deduplicate message IDs — fetchMessages can re-fire message_create on first chat load.
+const _processedMsgIds = new Set();
+
+// --- Helper: guard for API endpoints that require an active WhatsApp connection ---
+// Sends a 503 and returns false so the caller can `return` immediately.
+function requireReady(res) {
+    if (clientState !== "READY") {
+        res.status(503).json({
+            success: false,
+            error:   "WhatsApp client not ready.",
+            state:   clientState
+        });
+        return false;
+    }
+    return true;
+}
+
 // --- 1. PERSISTENT WEBSOCKET SERVER CONFIGURATION ---
 const wss = new WebSocket.Server({ server });
 
@@ -63,6 +84,7 @@ app.get('/api/status', (req, res) => {
 
 // API Endpoint 1: Send Outbound Message (POST)
 app.post('/api/send', async (req, res) => {
+    if (!requireReady(res)) return;
     const { to, message, quotedMessageId } = req.body;
     if (!to || !message) {
         return res.status(400).json({ error: "Parameters missing: 'to' and 'message' are required." });
@@ -83,6 +105,7 @@ app.post('/api/send', async (req, res) => {
 
 // API Endpoint 2: Fetch Last N Messages Directly From Cloud Servers (POST)
 app.post('/api/context', async (req, res) => {
+    if (!requireReady(res)) return;
     const { to, limit } = req.body;
     if (!to) {
         return res.status(400).json({ error: "Parameter missing: 'to' is required." });
@@ -95,13 +118,10 @@ app.post('/api/context', async (req, res) => {
         const chat = await whatsappClient.getChatById(targetId);
         const rawHistory = await chat.fetchMessages({ limit: fetchLimit });
 
-        const history = rawHistory.map(m => ({
-            timestamp: new Date(m.timestamp * 1000).toISOString(),
-            direction: m.fromMe ? 'OUTBOUND' : 'INBOUND',
-            body: m.body
-        }));
+        // Use buildContextHistory() for consistent shape (includes type + media fields)
+        const history = buildContextHistory(rawHistory);
 
-        return res.status(200).json({ success: true, phone: targetId, history: history });
+        return res.status(200).json({ success: true, phone: targetId, history });
     } catch (error) {
         return res.status(500).json({ success: false, error: "Could not fetch chat timeline: " + error.message });
     }
@@ -109,9 +129,7 @@ app.post('/api/context', async (req, res) => {
 
 // API Endpoint 3: List All Chats and Groups
 app.get('/api/chats', async (req, res) => {
-    if (clientState !== "READY") {
-        return res.status(503).json({ success: false, error: "WhatsApp client not ready.", state: clientState });
-    }
+    if (!requireReady(res)) return;
     try {
         const raw = await whatsappClient.getChats();
         const chats = raw.map(chat => ({
@@ -138,6 +156,7 @@ app.get('/api/chats', async (req, res) => {
 
 // API Endpoint 4: Show typing indicator
 app.post('/api/typing', async (req, res) => {
+    if (!requireReady(res)) return;
     const { to, duration } = req.body;
     if (!to) return res.status(400).json({ error: "'to' is required." });
     const targetId = to.includes('@') ? to : `${to.replace(/[+\s]/g, '')}@c.us`;
@@ -154,6 +173,7 @@ app.post('/api/typing', async (req, res) => {
 
 // API Endpoint 5: Mark chat as read (clears unread badge)
 app.post('/api/seen', async (req, res) => {
+    if (!requireReady(res)) return;
     const { to } = req.body;
     if (!to) return res.status(400).json({ error: "'to' is required." });
     const targetId = to.includes('@') ? to : `${to.replace(/[+\s]/g, '')}@c.us`;
@@ -168,6 +188,7 @@ app.post('/api/seen', async (req, res) => {
 
 // API Endpoint 6: React to a message with an emoji
 app.post('/api/react', async (req, res) => {
+    if (!requireReady(res)) return;
     const { messageId, emoji } = req.body;
     if (!messageId || !emoji) return res.status(400).json({ error: "'messageId' and 'emoji' are required." });
     try {
@@ -181,6 +202,7 @@ app.post('/api/react', async (req, res) => {
 
 // API Endpoint 7: Get contact info (name, number, about, profile pic)
 app.get('/api/contact/:jid', async (req, res) => {
+    if (!requireReady(res)) return;
     const jid = req.params.jid;
     try {
         const contact = await whatsappClient.getContactById(jid);
@@ -204,6 +226,7 @@ app.get('/api/contact/:jid', async (req, res) => {
 
 // API Endpoint 8: Get group participant list
 app.get('/api/group/:jid/participants', async (req, res) => {
+    if (!requireReady(res)) return;
     const jid = req.params.jid;
     try {
         const chat = await whatsappClient.getChatById(jid);
@@ -222,6 +245,7 @@ app.get('/api/group/:jid/participants', async (req, res) => {
 
 // API Endpoint 9: Download media from a specific message (on-demand, not automatic)
 app.post('/api/media', async (req, res) => {
+    if (!requireReady(res)) return;
     const { messageId } = req.body;
     if (!messageId) return res.status(400).json({ error: "'messageId' is required." });
     try {
@@ -242,6 +266,7 @@ app.post('/api/media', async (req, res) => {
 
 // API Endpoint 10: Search messages in a chat
 app.post('/api/search', async (req, res) => {
+    if (!requireReady(res)) return;
     const { to, query, limit } = req.body;
     if (!to || !query) return res.status(400).json({ error: "'to' and 'query' are required." });
     const targetId = to.includes('@') ? to : `${to.replace(/[+\s]/g, '')}@c.us`;
@@ -262,13 +287,20 @@ app.post('/api/search', async (req, res) => {
 
 // API Endpoint 11: Archive or unarchive a chat
 app.post('/api/archive', async (req, res) => {
+    if (!requireReady(res)) return;
     const { to, archive } = req.body;
     if (!to) return res.status(400).json({ error: "'to' is required." });
     const targetId = to.includes('@') ? to : `${to.replace(/[+\s]/g, '')}@c.us`;
     try {
         const chat = await whatsappClient.getChatById(targetId);
-        const shouldArchive = archive !== false;
-        await chat.archive(shouldArchive);
+        const shouldArchive = archive !== false; // Default: archive=true when param is omitted
+        // Bug fix: whatsapp-web.js exposes separate archive() and unarchive() methods;
+        // passing a boolean to archive() is silently ignored — unarchiving would never work.
+        if (shouldArchive) {
+            await chat.archive();
+        } else {
+            await chat.unarchive();
+        }
         return res.status(200).json({ success: true, archived: shouldArchive });
     } catch (err) {
         return res.status(500).json({ success: false, error: err.message });
@@ -340,13 +372,6 @@ whatsappClient.on('disconnected', (reason) => {
     broadcast('SYSTEM_DISCONNECTED', { reason });
 });
 
-// Deduplicate message IDs — fetchMessages can re-fire message_create on first chat load
-const _processedMsgIds = new Set();
-
-// The logged-in user's phone number — resolved from the WhatsApp session on 'ready'.
-// Never hardcoded; safe to publish on GitHub.
-let resolvedMyNumber = null;
-
 // --- Helper: did this message @mention the session owner? ---
 // Reads identity directly from the live WhatsApp session — no config, no hardcoding.
 //
@@ -392,9 +417,10 @@ async function didMentionMe(msg) {
 function extractMediaInfo(msg) {
     const msgType = (msg.type || 'chat').toLowerCase();
 
-    // Plain text — no media
+    // Plain text — no media.
+    // Bug fix: include caption (= msg.body) so mediaLabel() never receives undefined.
     if (msgType === 'chat' || msgType === 'text') {
-        return { type: 'text', hasMedia: false };
+        return { type: 'text', hasMedia: false, caption: msg.body || null };
     }
 
     const info = {
@@ -447,7 +473,8 @@ function extractMediaInfo(msg) {
 // --- Helper: short label for console log ---
 function mediaLabel(mediaInfo) {
     switch (mediaInfo.type) {
-        case 'text':        return `"${mediaInfo.caption}"`;
+        // Bug fix: null-guard caption — empty messages have caption=null, not a string.
+        case 'text':        return mediaInfo.caption != null ? `"${mediaInfo.caption}"` : '[empty message]';
         case 'image':       return mediaInfo.caption ? `[Image] "${mediaInfo.caption}"` : '[Image]';
         case 'video':       return mediaInfo.isGif   ? '[GIF]'   : (mediaInfo.caption ? `[Video] "${mediaInfo.caption}"` : '[Video]');
         case 'audio':       return '[Audio]';
@@ -544,7 +571,7 @@ whatsappClient.on('message_create', async (msg) => {
 });
 
 // --- 4. START SERVICE LAYER ---
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT) || 3000;
 server.listen(PORT, () => {
     console.log(`API Server & WebSocket engine deployed on port ${PORT}`);
     whatsappClient.initialize();
